@@ -4,20 +4,24 @@
 //To check VID and PID of device: 'lsusb' (same command to get the VID and PID of device in accessory mode)
 //To check the IN and OUT endpoints for the accessory, run (after device in accessory mode): 'lsusb -v' 
 //	(the only endpoints should be bulk due to android accessory protocol)
-//To compile: gcc usbmodule.c -I/usr/include/ -o usbmodule -lusb-1.0 -I/usr/include/ -I/usr/include/libusb-1.0
+//To compile:
+//	gcc usbmodule.c threads.c -pthread -I/usr/include/ -o usbmodule -lusb-1.0 -I/usr/include/ -I/usr/include/libusb-1.0
 
-//Thanks go to Manuel di Cerbo, for an example
+//Thanks go to Manuel di Cerbo, for providing an example
 
 #include <stdio.h>
 #include <usb.h>
 #include <libusb.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include "threads.h"
 
-
+//#define IN 0x85
+//#define OUT 0x07
 #define IN 0x81	//Accessory
 #define OUT 0x02 //Accessory
-//#define IN 0x82	//Accessory Samsung
+//#define IN 0x82	//Accessory SAmsung
 //#define OUT 0x04 //Accessory
 
 #define VID 0x18D1 //Google
@@ -25,13 +29,17 @@
 //#define VID 0x22B8 //Motorola
 //#define PID 0x2E82 //Moto G
 //#define VID 0x04e8 //Samsung
-//#define PID 0x6860 
+//#define PID 0x6860 //Samsung
 
-#define ACCESSORY_PID 0x2D01 // Used when usb debug activated
-#define ACCESSORY_PID_ALT 0x2D00 //Used generally
-#define ACCESSORY_VID 0x18D1 //Google
+#define ACCESSORY_PID 0x2D01
+#define ACCESSORY_PID_ALT 0x2D00
+#define ACCESSORY_VID 0x18D1 //google
 
 #define LEN 2
+
+/*
+Tested for Nexus 5 with KitKat 4.4.3
+*/
 
 static int mainPhase();
 static int mainPhaseOut();
@@ -49,13 +57,90 @@ static int setupAccessory(
 
 //static
 static struct libusb_device_handle* handle;
-static char stop;
-static char success = 0;
+pthread_mutex_t lock; //access control to the usb sockets by the threads
+pthread_mutex_t lock_t1; //locks for the flags
+pthread_mutex_t lock_t2;
+int t1, t2; //flags that indicate if these threads are running
+pthread_t thread1, thread2;
 
-int main (int argc, char *argv[]){
-	if(init() < 0)
-		return;
-	//doTransfer();
+//This will run everytime we need to send something to Android
+void *InfoThread(void *msgStruct){
+    pthread_mutex_lock(&lock_t2);
+    t2 = 1;
+    pthread_mutex_unlock(&lock_t2);
+
+    int transferred;
+    int response = 0;
+    unsigned char buffer[16384];
+
+    tData *data = (tData*)msgStruct;
+    sprintf(buffer, "%s", data->message);
+
+    pthread_mutex_lock(&lock);
+    response = libusb_bulk_transfer(handle,OUT,buffer, strlen(buffer)+1, &transferred,0); //timeout in secs (0 == no timeout)
+    pthread_mutex_unlock(&lock);
+
+    if(response < 0){error(response);return;}
+
+    write(1, buffer, strlen(buffer)); //because printf tends to buffer instead of printing right away
+    write(1, "\n", 1);
+
+    free(data->message);
+    free(data);
+
+    pthread_mutex_lock(&lock_t2);
+    t2 = 0;
+    pthread_mutex_unlock(&lock_t2);
+}
+
+//Keep Alive thread that guarantees USB communication never hangs between RPi-Android
+//A ping is sent every second
+void *KeepAliveThread(void *msgStruct)
+{
+    pthread_mutex_lock(&lock_t1);
+    t1 = 1;
+    pthread_mutex_unlock(&lock_t1);
+
+	int transferred; //if used to write out, this will contain the num of bytes written
+    int response = 0;
+
+    tData *data = (tData*)msgStruct;
+    free(data->message); //the parameters for the thread are not needed here, we can free them
+    free(data);
+
+	unsigned char buffer[16384];
+
+	char *ping = "ping";
+    int pingCounter = 0;
+
+    sleep(5);
+    printf("Sending data to device\n");
+
+
+    while(1){
+		sprintf(buffer, "%s %d", ping, pingCounter++);
+
+        pthread_mutex_lock(&lock);
+        response = libusb_bulk_transfer(handle,OUT,buffer, strlen(buffer)+1, &transferred,0); //timeout in secs (0 == no timeout)
+        pthread_mutex_unlock(&lock);
+
+        if(response < 0){error(response);break;}
+
+        write(1, buffer, strlen(buffer)); //because printf tends to buffer instead of printing right away
+        write(1, "\n", 1);
+        sleep(1);
+	}
+    pthread_mutex_lock(&lock_t1);
+    t1 = 0;
+    pthread_mutex_unlock(&lock_t1);
+}
+
+//Returns 4 if successful
+int UsbInit(){
+    if(init() < 0){
+        fprintf(stdout, "Error initiating accessory\n");
+		return -1;
+    }
 	if(setupAccessory(
 		    "DebugWithPrintf",//"Manufacturer",
 		    "androidusb",//"Model",
@@ -67,12 +152,80 @@ int main (int argc, char *argv[]){
 		deInit();
 		return -1;
 	};
-    //if(mainPhase() < 0){
-	if(mainPhaseOut() < 0){
-		fprintf(stdout, "Error during main phase\n");
-		deInit();
-		return -1;
-	}	
+
+    return 4;
+}
+
+void sigintHandler(int sig_num)
+{
+    int t1_on,t2_on;
+
+    pthread_mutex_lock(&lock_t1);
+    t1_on = t1;
+    pthread_mutex_unlock(&lock_t1);
+
+    pthread_mutex_lock(&lock_t2);
+    t2_on = t2;
+    pthread_mutex_unlock(&lock_t2);
+
+    if(t1_on) pthread_cancel(thread1);
+    if(t2_on) pthread_cancel(thread2);
+
+    deInit();
+
+    exit(1);
+}
+
+
+int main (int argc, char *argv[]){
+
+    int initReturn;
+    tData *tdata1;
+    tData *tdata2;
+    int rc = 0;
+    char input[50];
+    int counter = 0;
+    int tid1 = 0, tid2 = 1;
+
+    signal(SIGINT, sigintHandler);
+    initReturn = UsbInit();
+
+    if(initReturn != 4) //non-succesful init
+        return 0;
+
+    //Initializing mutexes
+    if (pthread_mutex_init(&lock, NULL) != 0){printf("\n Mutex init failed\n");return 1;}
+    if (pthread_mutex_init(&lock_t1, NULL) != 0){printf("\n Mutex init failed\n");return 1;}
+    if (pthread_mutex_init(&lock_t2, NULL) != 0){printf("\n Mutex init failed\n");return 1;}
+
+    //KeepAliveThread
+    buildThreadData(&tdata1, tid1, "not_used_for_this_case");
+    rc = pthread_create(&thread1, NULL, KeepAliveThread, (void *)tdata1);
+    if (rc){
+         printf("ERROR; return code from pthread_create() is %d\n", rc);
+         exit(-1);
+    }
+
+    //input cycle... will simulate the coordinates from the RPi
+    while(1){
+
+        scanf("%s", input);
+        if(strcmp(input, "quit") == 0)
+            break;
+
+        //A thread is created for each individual transfer
+        sprintf(input, "%d %s", counter++, "something something the coordinates of the dark side");
+        buildThreadData(&tdata2, tid2, input);
+        rc = pthread_create(&thread2, NULL, InfoThread, (void *)tdata2);
+        if (rc){
+             printf("ERROR; return code from pthread_create() is %d\n", rc);
+             exit(-1);
+        }
+    }
+
+    pthread_exit(NULL); //forces the main() to wait for the threads
+    pthread_mutex_destroy(&lock);
+
 	deInit();
 	fprintf(stdout, "Done, no errors\n");
 	return 0;
@@ -92,46 +245,11 @@ static int mainPhase(){
 	return 0;
 }
 
-static int mainPhaseOut(){
-	unsigned char buffer[16384];
-	int response = 0;
-	static int transferred;
-	
-	//These are for test purposes, the RPi will get the real values by contacting GPS module and OBDII
-	char *id = "14";
-	int hours = 10;
-	int minutes = 11;
-	int secs = 12;
-	float latitude = 34.123512;
-	float longitude = 9.102311;
-	unsigned int current_speed = 4;
-	unsigned int current_rpm = 2500;
-	
-    sleep(10);
-    printf("Sending data to device\n");
-	
-	while(1){
-        
-		sprintf(buffer, "%s %d %d %d %f %f %u %u", id, hours, minutes, secs, latitude, longitude, current_speed, current_rpm);
-		current_rpm++; //Teste
-        response = LIBUSB_ERROR_TIMEOUT;
-        int tries =0;
-		response = libusb_bulk_transfer(handle,OUT,buffer, strlen(buffer)+1, &transferred,0); //timeout in secs (0 == no timeout)
-        
-		if(response < 0){error(response);return -1;}
-        //printf("%s", buffer);
-        write(1, buffer, strlen(buffer)); //because printf tends to buffer instead of printing right away
-        write(1, "\n", 1);
-        sleep(1);
-	}
-    return 0;
-}
-
 
 static int init(){
 	libusb_init(NULL);
 	if((handle = libusb_open_device_with_vid_pid(NULL, VID, PID)) == NULL){
-		fprintf(stdout, "Problem acquiring handle\n");
+		fprintf(stdout, "Problem acquireing handle\n");
 		return -1;
 	}
 	libusb_claim_interface(handle, 0);
@@ -300,5 +418,3 @@ static void status(int code){
 			break;
 	}
 }
-
-
