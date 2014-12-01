@@ -1,0 +1,6 @@
+Run C code on RPi side. It will prompt the app.
+
+TODO:
+- PID, VID, from the device as well as from the accessory (which is different!) and accessory mode IN and OUT USB endpoints are hardcoded;
+Unlike pyusb, with libusb, you need to get these by hand for now... using 'lsusb', and 'lsusb -v' has worked so far, but this should
+really be automatic.
