@@ -63,7 +63,7 @@ pthread_mutex_t lock_t2;
 int t1, t2; //flags that indicate if these threads are running
 pthread_t thread1, thread2;
 
-//This will run everytime we need to send something to Android
+//This will run every time we need to send something to Android
 void *InfoThread(void *msgStruct){
     pthread_mutex_lock(&lock_t2);
     t2 = 1;
@@ -156,6 +156,7 @@ int UsbInit(){
     return 4;
 }
 
+//Properly cancels the threads, releases the interface and closes the libusb
 void sigintHandler(int sig_num)
 {
     int t1_on,t2_on;
@@ -257,9 +258,6 @@ static int init(){
 }
 
 static int deInit(){
-	//TODO free all transfers individually...
-	//if(ctrlTransfer != NULL)
-	//	libusb_free_transfer(ctrlTransfer);
 	if(handle != NULL){
 		libusb_release_interface (handle, 0);
 		libusb_close(handle);
@@ -281,6 +279,9 @@ static int setupAccessory(
 	int response;
 	int tries = 10;
 
+	//AOA protocol
+	//A 51 control request ("Get Protocol") to figure out if the device
+	//supports the Android accessory protocol.
 	response = libusb_control_transfer(
 		handle, //handle
 		0xC0, //bmRequestType
@@ -294,11 +295,20 @@ static int setupAccessory(
 
 	if(response < 0){error(response);return-1;}
 
+	//AOA protocol
+	//A non-zero number is returned if the protocol is supported,
+	//which represents the version of the protocol that the device supports
 	devVersion = ioBuffer[1] << 8 | ioBuffer[0];
 	fprintf(stdout,"Version Code Device: %d\n", devVersion);
 	
 	usleep(1000);//sometimes hangs on the next transfer :(
 
+	//AOA protocol
+	//If the device returns a proper protocol version, send identifying string
+	//information to the device with a request 52.
+	//This information allows the Android device to figure out an appropriate
+	//application for this accessory and also present the user with a URL
+	//if an appropriate application does not exist.
 	response = libusb_control_transfer(handle,0x40,52,0,0,(char*)manufacturer,strlen(manufacturer)+1,0);
 	if(response < 0){error(response);return -1;}
 	response = libusb_control_transfer(handle,0x40,52,0,1,(char*)modelName,strlen(modelName)+1,0);
@@ -314,6 +324,8 @@ static int setupAccessory(
 
 	fprintf(stdout,"Accessory Identification sent\n", devVersion);
 
+	//AOA protocol
+	//A control request 53 requests that the device start up in accessory mode
 	response = libusb_control_transfer(handle,0x40,53,0,0,NULL,0,0);
 	if(response < 0){error(response);return -1;}
 
