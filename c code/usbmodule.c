@@ -5,7 +5,7 @@
 //To check the IN and OUT endpoints for the accessory, run (after device in accessory mode): 'lsusb -v' 
 //	(the only endpoints should be bulk due to android accessory protocol)
 //To compile:
-//	gcc usbmodule.c threads.c -pthread -I/usr/include/ -o usbmodule -lusb-1.0 -I/usr/include/ -I/usr/include/libusb-1.0
+//	gcc usbmodule.c threads.c -pthread -o usbmodule -lusb-1.0 -I/usr/include/libusb-1.0
 
 //Thanks go to Manuel di Cerbo, for providing an example
 
@@ -15,7 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
-#include "threads.h"
+#include "usbmodule.h"
 
 //#define IN 0x85
 //#define OUT 0x07
@@ -57,11 +57,7 @@ static int setupAccessory(
 
 //static
 static struct libusb_device_handle* handle;
-pthread_mutex_t lock; //access control to the usb sockets by the threads
-pthread_mutex_t lock_t1; //locks for the flags
-pthread_mutex_t lock_t2;
-int t1, t2; //flags that indicate if these threads are running
-pthread_t thread1, thread2;
+
 
 //This will run every time we need to send something to Android
 void *InfoThread(void *msgStruct){
@@ -75,6 +71,9 @@ void *InfoThread(void *msgStruct){
 
     tData *data = (tData*)msgStruct;
     sprintf(buffer, "%s", data->message);
+
+    pthread_testcancel();//Deferred cancelability (default) means that cancellation will be
+                         //delayed until the thread next calls a function that is a cancellation point.
 
     pthread_mutex_lock(&lock);
     response = libusb_bulk_transfer(handle,OUT,buffer, strlen(buffer)+1, &transferred,0); //timeout in secs (0 == no timeout)
@@ -95,7 +94,7 @@ void *InfoThread(void *msgStruct){
 
 //Keep Alive thread that guarantees USB communication never hangs between RPi-Android
 //A ping is sent every second
-void *KeepAliveThread(void *msgStruct)
+void *KeepAliveThread(void *not_used)
 {
     pthread_mutex_lock(&lock_t1);
     t1 = 1;
@@ -103,10 +102,6 @@ void *KeepAliveThread(void *msgStruct)
 
 	int transferred; //if used to write out, this will contain the num of bytes written
     int response = 0;
-
-    tData *data = (tData*)msgStruct;
-    free(data->message); //the parameters for the thread are not needed here, we can free them
-    free(data);
 
 	unsigned char buffer[16384];
 
@@ -120,6 +115,8 @@ void *KeepAliveThread(void *msgStruct)
     while(1){
 		sprintf(buffer, "%s %d", ping, pingCounter++);
 
+        pthread_testcancel();//Deferred cancelability (default) means that cancellation will be
+                             //delayed until the thread next calls a function that is a cancellation point.
         pthread_mutex_lock(&lock);
         response = libusb_bulk_transfer(handle,OUT,buffer, strlen(buffer)+1, &transferred,0); //timeout in secs (0 == no timeout)
         pthread_mutex_unlock(&lock);
@@ -135,7 +132,7 @@ void *KeepAliveThread(void *msgStruct)
     pthread_mutex_unlock(&lock_t1);
 }
 
-//Returns 4 if successful
+//Returns 4 if init was successful
 int UsbInit(){
     if(init() < 0){
         fprintf(stdout, "Error initiating accessory\n");
@@ -156,80 +153,8 @@ int UsbInit(){
     return 4;
 }
 
-//Properly cancels the threads, releases the interface and closes the libusb
-void sigintHandler(int sig_num)
-{
-    int t1_on,t2_on;
-
-    pthread_mutex_lock(&lock_t1);
-    t1_on = t1;
-    pthread_mutex_unlock(&lock_t1);
-
-    pthread_mutex_lock(&lock_t2);
-    t2_on = t2;
-    pthread_mutex_unlock(&lock_t2);
-
-    if(t1_on) pthread_cancel(thread1);
-    if(t2_on) pthread_cancel(thread2);
-
-    deInit();
-
-    exit(1);
-}
-
-
-int main (int argc, char *argv[]){
-
-    int initReturn;
-    tData *tdata1;
-    tData *tdata2;
-    int rc = 0;
-    char input[50];
-    int counter = 0;
-    int tid1 = 0, tid2 = 1;
-
-    signal(SIGINT, sigintHandler);
-    initReturn = UsbInit();
-
-    if(initReturn != 4) //non-succesful init
-        return 0;
-
-    //Initializing mutexes
-    if (pthread_mutex_init(&lock, NULL) != 0){printf("\n Mutex init failed\n");return 1;}
-    if (pthread_mutex_init(&lock_t1, NULL) != 0){printf("\n Mutex init failed\n");return 1;}
-    if (pthread_mutex_init(&lock_t2, NULL) != 0){printf("\n Mutex init failed\n");return 1;}
-
-    //KeepAliveThread
-    buildThreadData(&tdata1, tid1, "not_used_for_this_case");
-    rc = pthread_create(&thread1, NULL, KeepAliveThread, (void *)tdata1);
-    if (rc){
-         printf("ERROR; return code from pthread_create() is %d\n", rc);
-         exit(-1);
-    }
-
-    //input cycle... will simulate the coordinates from the RPi
-    while(1){
-
-        scanf("%s", input);
-        if(strcmp(input, "quit") == 0)
-            break;
-
-        //A thread is created for each individual transfer
-        sprintf(input, "%d %s", counter++, "something something the coordinates of the dark side");
-        buildThreadData(&tdata2, tid2, input);
-        rc = pthread_create(&thread2, NULL, InfoThread, (void *)tdata2);
-        if (rc){
-             printf("ERROR; return code from pthread_create() is %d\n", rc);
-             exit(-1);
-        }
-    }
-
-    pthread_exit(NULL); //forces the main() to wait for the threads
-    pthread_mutex_destroy(&lock);
-
-	deInit();
-	fprintf(stdout, "Done, no errors\n");
-	return 0;
+int UsbDeInit(){
+    return deInit();
 }
 
 static int mainPhase(){
