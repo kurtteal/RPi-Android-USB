@@ -14,7 +14,6 @@
 #include <libusb.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include "usbmodule.h"
 
 //#define IN 0x85
@@ -59,11 +58,18 @@ static int setupAccessory(
 static struct libusb_device_handle* handle;
 
 
+int flagKeepAlive;//this will be set to zero if the thread is cancelled (has to be global for the handler)
+
+static void KA_cleanup_handler(void *arg) //Whatever is put will be run on a cancel order
+{
+      t1 = 0; //not needed
+      printf("KeepAlive clean-up handler is running...\n");
+      flagKeepAlive--; //to break out of the loop on the keep alive thread
+}
+
 //This will run every time we need to send something to Android
 void *InfoThread(void *msgStruct){
-    pthread_mutex_lock(&lock_t2);
-    t2 = 1;
-    pthread_mutex_unlock(&lock_t2);
+    t2 = 1; //not needed
 
     int transferred;
     int response = 0;
@@ -71,9 +77,6 @@ void *InfoThread(void *msgStruct){
 
     tData *data = (tData*)msgStruct;
     sprintf(buffer, "%s", data->message);
-
-    pthread_testcancel();//Deferred cancelability (default) means that cancellation will be
-                         //delayed until the thread next calls a function that is a cancellation point.
 
     pthread_mutex_lock(&lock);
     response = libusb_bulk_transfer(handle,OUT,buffer, strlen(buffer)+1, &transferred,0); //timeout in secs (0 == no timeout)
@@ -87,18 +90,14 @@ void *InfoThread(void *msgStruct){
     free(data->message);
     free(data);
 
-    pthread_mutex_lock(&lock_t2);
-    t2 = 0;
-    pthread_mutex_unlock(&lock_t2);
+    t2 = 0; //not needed
 }
 
 //Keep Alive thread that guarantees USB communication never hangs between RPi-Android
 //A ping is sent every second
 void *KeepAliveThread(void *not_used)
 {
-    pthread_mutex_lock(&lock_t1);
-    t1 = 1;
-    pthread_mutex_unlock(&lock_t1);
+    t1 = 1; //not needed
 
 	int transferred; //if used to write out, this will contain the num of bytes written
     int response = 0;
@@ -111,8 +110,10 @@ void *KeepAliveThread(void *not_used)
     sleep(5);
     printf("Sending data to device\n");
 
+    flagKeepAlive = 1;
 
-    while(1){
+    pthread_cleanup_push(KA_cleanup_handler, NULL); //puts the handler function on top of the stack
+    while(flagKeepAlive){
 		sprintf(buffer, "%s %d", ping, pingCounter++);
 
         pthread_testcancel();//Deferred cancelability (default) means that cancellation will be
@@ -127,9 +128,7 @@ void *KeepAliveThread(void *not_used)
         write(1, "\n", 1);
         sleep(1);
 	}
-    pthread_mutex_lock(&lock_t1);
-    t1 = 0;
-    pthread_mutex_unlock(&lock_t1);
+    pthread_cleanup_pop(0); //takes the handler out of the top of the stack
 }
 
 //Returns 4 if init was successful
