@@ -31,6 +31,7 @@ int main (int argc, char *argv[]){
     //input cycle... will simulate the coordinates from the RPi
     while(1){
 
+    	//Just type in anything to send the string...
         scanf("%s", input);
         if(strcmp(input, "quit") == 0)
             break;
